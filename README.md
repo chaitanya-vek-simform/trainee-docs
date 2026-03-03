@@ -11,6 +11,7 @@
 |----------|-------------|
 | [🪟 Windows](windows/) | Windows Server, Active Directory, GPO, DNS, DHCP, PowerShell |
 | [🐧 Linux](linux/) | _Coming soon_ — Fundamentals, shell scripting, systemd, networking |
+| [🌐 Servers](servers/) | Nginx, Apache, IIS — reverse proxy, SSL, static hosting, production Q&A |
 
 ---
 
@@ -20,6 +21,9 @@
 |------------|----------|
 | [Windows Server 2022](windows/windows_server_2022_cheatsheet.md) | Windows |
 | [Linux Admin Handbook](linux/linux_admin_handbook.md) | Linux |
+| [Nginx](servers/nginx.md) | Servers |
+| [Apache HTTP Server](servers/apache.md) | Servers |
+| [IIS (Internet Information Services)](servers/iis.md) | Servers |
 
 ---
 
@@ -30,9 +34,15 @@
 ├── windows/
 │   ├── README.md          ← Windows category index
 │   └── windows_server_2022_cheatsheet.md
-└── linux/
-    ├── README.md          ← Linux category index (coming soon)
-    └── linux_admin_handbook.md ← Comprehensive Linux Admin Handbook
+├── linux/
+│   ├── README.md          ← Linux category index (coming soon)
+│   └── linux_admin_handbook.md
+└── servers/
+    ├── README.md          ← Servers category index
+    ├── PROGRESS.md        ← Batch writing progress tracker
+    ├── nginx.md           ← Nginx production guide
+    ├── apache.md          ← Apache HTTP Server production guide
+    └── iis.md             ← IIS production guide
 ```
 
 ---
