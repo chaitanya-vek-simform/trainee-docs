@@ -15,6 +15,9 @@
 | [🌐 Networking](networking/) | OSI/TCP-IP, subnetting, DNS, HTTP/TLS, firewalls, load balancers, VPNs, container networking |
 | [☁️ Cloud](cloud/) | Data centers, virtualization, AWS/Azure/GCP, IaC, serverless, containers, DR, FinOps |
 | [🧪 Labs](labs/) | Hands-on disaster recovery, troubleshooting, and infrastructure experiments |
+| [📜 Scripting](scripting/) | Bash & Python scripting for DevOps — automation, CI/CD, K8s, monitoring |
+| [☸️ Kubernetes](kubernetes/) | K8s architecture, workloads, networking, Helm, security, production patterns |
+| [☁️ Azure](azure/) | Azure DevOps, AKS, Pipelines, IaC (Bicep/Terraform), monitoring, security, migration |
 
 ---
 
@@ -31,6 +34,9 @@
 | [Data Centers & Cloud Computing Handbook](cloud/cloud_handbook.md) | Cloud |
 | [Linux DR — Rebuilding After `/etc` Deletion](labs/linux_etc_disaster_recovery.md) | Labs |
 | [Nginx Config Recovery — PhotoRec File Carving](labs/nginx_config_recovery_photorec.md) | Labs |
+| [Scripting for DevOps Handbook](scripting/scripting_handbook.md) | Scripting |
+| [Kubernetes Handbook](kubernetes/kubernetes_handbook.md) | Kubernetes |
+| [DevOps on Azure Handbook](azure/azure_handbook.md) | Azure |
 
 ---
 
@@ -74,6 +80,18 @@
     ├── iis_practice_lab.md
     ├── linux_etc_disaster_recovery.md
     └── nginx_config_recovery_photorec.md
+├── scripting/
+│   ├── README.md          ← Scripting category index
+│   ├── scripting_handbook.md  ← Bash & Python for DevOps guide
+│   └── scripting_batch_state.md  ← Batch review tracker
+├── kubernetes/
+│   ├── README.md          ← Kubernetes category index
+│   ├── kubernetes_handbook.md  ← Comprehensive K8s guide
+│   └── kubernetes_batch_state.md  ← Batch review tracker
+├── azure/
+│   ├── README.md          ← Azure category index
+│   ├── azure_handbook.md  ← DevOps on Azure guide
+│   └── azure_batch_state.md  ← Batch review tracker
 ```
 
 ---
