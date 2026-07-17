@@ -4006,3 +4006,666 @@ A: Back up both cluster state AND persistent data.
 ---
 
 [🏠 Home](../README.md) · [Kubernetes](README.md)
+
+---
+
+## 21. Cluster Maintenance (CKA Core)
+
+### 21.1 Node Drain, Cordon, Uncordon
+
+```bash
+# Cordon: mark node unschedulable (no new pods, existing pods stay)
+kubectl cordon node01
+
+# Drain: cordon + evict all pods (safe for maintenance)
+kubectl drain node01 --ignore-daemonsets --delete-emptydir-data
+
+# --ignore-daemonsets : DaemonSet pods can't be evicted, skip them
+# --delete-emptydir-data : pods using emptyDir lose data, force delete
+# --force : delete pods not managed by a controller (orphan pods)
+
+# After maintenance, bring node back
+kubectl uncordon node01
+
+# Check node status
+kubectl get nodes
+kubectl describe node node01 | grep -A5 "Conditions"
+```
+
+```
+DRAIN SEQUENCE:
+1. Node cordoned (Unschedulable=true)
+2. Each pod gets SIGTERM (graceful shutdown)
+3. Pod's terminationGracePeriodSeconds countdown begins (default 30s)
+4. Pod evicted / deleted
+5. Controller (Deployment/RS) reschedules pod on another node
+6. If PDB blocks eviction → drain waits (or times out with --timeout)
+
+GOTCHA: drain blocks if PDB + single replica
+kubectl drain node01 --timeout=60s  # fail instead of blocking forever
+```
+
+### 21.2 Kubernetes Upgrade with kubeadm (Step by Step)
+
+```bash
+# ALWAYS upgrade one minor version at a time: 1.28 → 1.29, not 1.28 → 1.30
+
+# ── STEP 1: Upgrade control plane ────────────────────────────
+# On control plane node:
+apt-get update
+apt-cache madison kubeadm   # list available versions
+
+# Upgrade kubeadm
+apt-get install -y kubeadm=1.29.0-00
+
+# Check upgrade plan
+kubeadm upgrade plan
+
+# Apply upgrade
+kubeadm upgrade apply v1.29.0
+
+# Upgrade kubelet and kubectl on control plane
+apt-get install -y kubelet=1.29.0-00 kubectl=1.29.0-00
+systemctl daemon-reload && systemctl restart kubelet
+
+# ── STEP 2: Upgrade each worker node ─────────────────────────
+# From control plane: drain the worker
+kubectl drain node01 --ignore-daemonsets --delete-emptydir-data
+
+# ON the worker node:
+apt-get update
+apt-get install -y kubeadm=1.29.0-00
+kubeadm upgrade node
+
+apt-get install -y kubelet=1.29.0-00 kubectl=1.29.0-00
+systemctl daemon-reload && systemctl restart kubelet
+
+# Back on control plane: uncordon
+kubectl uncordon node01
+
+# Verify
+kubectl get nodes   # all nodes should show v1.29.0
+```
+
+### 21.3 etcd Backup and Restore (CKA Essential)
+
+```bash
+# ── BACKUP ───────────────────────────────────────────────────
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+
+# Verify backup
+ETCDCTL_API=3 etcdctl snapshot status /backup/etcd-snapshot.db \
+  --write-out=table
+
+# ── RESTORE ──────────────────────────────────────────────────
+# Stop kube-apiserver first (move static pod manifest)
+mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/
+
+# Restore to new data directory
+ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --data-dir=/var/lib/etcd-from-backup \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# Update etcd static pod to use new data dir
+# Edit /etc/kubernetes/manifests/etcd.yaml:
+# volumes.hostPath.path: /var/lib/etcd-from-backup
+
+# Restore kube-apiserver
+mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/
+
+# Wait for api server to come back
+kubectl get pods -n kube-system
+```
+
+### 21.4 Certificate Management
+
+```bash
+# Check certificate expiry (all certs)
+kubeadm certs check-expiration
+
+# Renew all certificates
+kubeadm certs renew all
+
+# Renew specific cert
+kubeadm certs renew apiserver
+kubeadm certs renew apiserver-kubelet-client
+
+# After renewal: restart control plane components
+systemctl restart kubelet
+# Static pods (apiserver, controller-manager, scheduler) auto-restart
+
+# View certificate details
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -dates -subject
+
+# Generate new kubeconfig after cert rotation
+kubeadm kubeconfig user --client-name admin > ~/.kube/config
+```
+
+### 21.5 OS-Level Node Maintenance
+
+```bash
+# Check what's running on a node before draining
+kubectl get pods -A --field-selector spec.nodeName=node01
+
+# Safe maintenance window approach:
+kubectl cordon node01          # Stop new scheduling
+# Wait for in-flight requests to complete (depends on app graceful shutdown)
+kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --timeout=300s
+# Perform OS maintenance (patching, reboot, disk replacement)
+sudo apt-get upgrade -y && sudo reboot
+# After node comes back
+kubectl uncordon node01
+# Verify pods are rescheduled back
+kubectl get pods -A --field-selector spec.nodeName=node01
+```
+
+---
+
+## 22. Kustomize (CKAD + CKA)
+
+### 22.1 What is Kustomize?
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  KUSTOMIZE vs HELM                                           │
+│                                                              │
+│  Helm:       Template engine — uses {{ .Values.x }} syntax  │
+│              Good for: distributing apps to others (charts) │
+│              Downside: YAML becomes unreadable with templates│
+│                                                              │
+│  Kustomize:  Overlay engine — YAML stays pure YAML          │
+│              Good for: managing env differences (dev/prod)  │
+│              Downside: less flexible than Helm for packaging │
+│                                                              │
+│  Key idea: BASE defines the common config.                  │
+│            OVERLAYs patch only what differs per environment.│
+│  No new syntax — just standard YAML + a kustomization.yaml  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 22.2 Directory Structure
+
+```
+k8s/
+├── base/                        ← shared across all envs
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── configmap.yaml
+└── overlays/
+    ├── dev/                     ← dev-specific patches
+    │   ├── kustomization.yaml
+    │   └── patch-replicas.yaml
+    ├── staging/
+    │   ├── kustomization.yaml
+    │   └── patch-replicas.yaml
+    └── production/
+        ├── kustomization.yaml
+        ├── patch-replicas.yaml
+        └── patch-resources.yaml
+```
+
+### 22.3 Base kustomization.yaml
+
+```yaml
+# k8s/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml
+
+commonLabels:
+  app: myapp
+  managed-by: kustomize
+
+commonAnnotations:
+  team: backend
+```
+
+### 22.4 Overlay kustomization.yaml
+
+```yaml
+# k8s/overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+  - ../../base
+
+# Set namespace for this overlay
+namespace: production
+
+# Change image tag
+images:
+  - name: myapp
+    newTag: v2.1.0
+    newName: ghcr.io/myorg/myapp
+
+# Add env-specific labels
+commonLabels:
+  environment: production
+
+# Strategic merge patch (patch individual fields)
+patchesStrategicMerge:
+  - patch-replicas.yaml
+  - patch-resources.yaml
+
+# JSON6902 patch (precise field targeting)
+patches:
+  - target:
+      kind: Deployment
+      name: myapp
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 5
+```
+
+```yaml
+# k8s/overlays/production/patch-replicas.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  replicas: 5        # overrides base value
+```
+
+```yaml
+# k8s/overlays/production/patch-resources.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: myapp
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+```
+
+### 22.5 Kustomize Commands
+
+```bash
+# Preview what will be applied (dry-run)
+kubectl kustomize k8s/overlays/production
+
+# Apply production overlay
+kubectl apply -k k8s/overlays/production
+
+# Apply dev overlay
+kubectl apply -k k8s/overlays/dev
+
+# Delete resources defined by overlay
+kubectl delete -k k8s/overlays/production
+
+# Kustomize is built into kubectl (no separate install needed)
+# But for latest features, install standalone:
+# curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+kustomize build k8s/overlays/production | kubectl apply -f -
+
+# Useful: see diff before applying
+kubectl diff -k k8s/overlays/production
+```
+
+### 22.6 Kustomize — Useful Features
+
+```yaml
+# ── Generate ConfigMap from file ─────────────────────────────
+# kustomization.yaml
+configMapGenerator:
+  - name: app-config
+    files:
+      - config/app.properties
+    literals:
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+
+# ── Generate Secret from literals ────────────────────────────
+secretGenerator:
+  - name: db-secret
+    literals:
+      - DB_PASSWORD=mysecretpassword
+    type: Opaque
+
+# ── Prefix/Suffix all resource names ─────────────────────────
+namePrefix: prod-
+nameSuffix: -v2
+
+# ── Add resource to base from overlay ────────────────────────
+# overlays/production/kustomization.yaml
+resources:
+  - ../../base
+  - extra-ingress.yaml      # add prod-only resource
+
+# ── Replace entire field value ────────────────────────────────
+replacements:
+  - source:
+      kind: ConfigMap
+      name: app-config
+      fieldPath: data.ENVIRONMENT
+    targets:
+      - select:
+          kind: Deployment
+          name: myapp
+        fieldPaths:
+          - spec.template.spec.containers.[name=myapp].env.[name=ENVIRONMENT].value
+```
+
+---
+
+## 23. Kubernetes with kubeadm (CKA Essential)
+
+### 23.1 What kubeadm Does
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  kubeadm = bootstrap tool for production-grade K8s clusters  │
+│                                                              │
+│  It handles:                                                 │
+│  ├── Generates all TLS certificates (PKI)                   │
+│  ├── Creates kubeconfig files for admin, kubelet, etc.      │
+│  ├── Deploys control plane as static pods                   │
+│  ├── Configures kubelet on each node                        │
+│  ├── Installs CoreDNS and kube-proxy                        │
+│  └── Creates bootstrap tokens for worker node joining       │
+│                                                              │
+│  What kubeadm does NOT handle:                              │
+│  ├── CNI plugin (you install Calico/Flannel/Cilium yourself)│
+│  ├── Load balancer for control plane HA                     │
+│  ├── etcd HA setup (single etcd by default)                │
+│  └── Cloud provider integration                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 23.2 Pre-Requisites on All Nodes
+
+```bash
+# ── On ALL nodes (control plane + workers) ───────────────────
+
+# 1. Disable swap (K8s requires swap to be off)
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab   # persist across reboots
+
+# 2. Load required kernel modules
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+
+
+---
+
+## 24. Gateway API (Modern Ingress — CKAD)
+
+### 24.1 Why Gateway API?
+
+```
+Ingress (old):          Single resource, all config in annotations,
+                        HTTP only, vendor-specific, no role separation.
+
+Gateway API (new):      Separate resources (GatewayClass, Gateway, HTTPRoute),
+                        role-based (infra vs dev team), HTTP/TCP/TLS/gRPC/UDP,
+                        standardized spec (portable across implementations).
+
+ROLES:
+Infrastructure provider  → GatewayClass (which implementation: Nginx/Contour/Istio)
+Cluster admin            → Gateway (listeners, TLS, ports)
+Developer                → HTTPRoute (routing rules to their services)
+```
+
+### 24.2 Gateway API YAML
+
+```yaml
+# GatewayClass
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx
+spec:
+  controllerName: k8s.nginx.org/nginx-gateway-controller
+
+---
+# Gateway (cluster admin owns this)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main-gateway
+  namespace: infra
+spec:
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: tls-secret
+
+---
+# HTTPRoute (developer owns this)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: myapp-route
+  namespace: myapp
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: infra
+  hostnames:
+    - "myapp.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-service
+          port: 8000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: frontend-service
+          port: 3000
+```
+
+---
+
+## 25. Vertical Pod Autoscaler — VPA (CKAD)
+
+```yaml
+# VPA recommends or auto-sets resource requests
+# Modes: Off (recommend only) | Initial (set at creation) | Auto (evict+recreate)
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: myapp-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: myapp
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: 2000m
+          memory: 2Gi
+        controlledResources: ["cpu", "memory"]
+```
+
+```
+GOTCHA: VPA + HPA on same metric = conflict.
+Use VPA for memory only + HPA for CPU.
+Or VPA in "Off" mode just for recommendations.
+
+Check VPA recommendations:
+kubectl describe vpa myapp-vpa
+```
+
+---
+
+## 26. CKA & CKAD — Imperative Commands Cheatsheet
+
+```bash
+# ── CREATE RESOURCES FAST ─────────────────────────────────────
+kubectl run nginx --image=nginx --port=80
+kubectl run busybox --image=busybox -- sleep 3600
+kubectl run nginx --image=nginx --dry-run=client -o yaml > pod.yaml
+
+kubectl create deployment myapp --image=nginx --replicas=3
+kubectl create deployment myapp --image=nginx --dry-run=client -o yaml > deploy.yaml
+
+kubectl expose pod nginx --port=80 --target-port=80 --type=ClusterIP
+kubectl expose deployment myapp --port=80 --target-port=8080 --type=NodePort
+
+kubectl create configmap my-config --from-literal=KEY=VALUE
+kubectl create configmap my-config --from-file=config.properties
+kubectl create secret generic my-secret --from-literal=PASSWORD=secret123
+kubectl create secret docker-registry regcred \
+  --docker-server=ghcr.io --docker-username=myuser --docker-password=mytoken
+
+kubectl create serviceaccount my-sa
+kubectl create role pod-reader --verb=get,list,watch --resource=pods
+kubectl create rolebinding pod-reader-binding --role=pod-reader --serviceaccount=default:my-sa
+kubectl create clusterrole node-reader --verb=get,list --resource=nodes
+kubectl create clusterrolebinding node-reader-binding --clusterrole=node-reader --user=jane
+
+# ── EDIT RUNNING RESOURCES ────────────────────────────────────
+kubectl edit deployment myapp
+kubectl set image deployment/myapp app=nginx:1.25
+kubectl set resources deployment myapp -c app --requests=cpu=200m,memory=256Mi --limits=cpu=500m,memory=512Mi
+kubectl scale deployment myapp --replicas=5
+kubectl rollout undo deployment/myapp
+kubectl rollout status deployment/myapp
+
+# ── DEBUGGING ─────────────────────────────────────────────────
+kubectl exec -it pod/mypod -- bash
+kubectl exec -it pod/mypod -c sidecar -- sh
+kubectl logs mypod -f --tail=50
+kubectl logs mypod -c init-container --previous
+kubectl port-forward pod/mypod 8080:80
+kubectl top pods --sort-by=cpu
+kubectl describe pod mypod | grep -A10 Events
+
+# ── EXAM PRODUCTIVITY TIPS ────────────────────────────────────
+# Add to ~/.bashrc in exam:
+alias k=kubectl
+export do='--dry-run=client -o yaml'
+source ~/.bashrc
+# Usage: k run nginx --image=nginx $do > pod.yaml
+
+# Switch cluster context:
+kubectl config get-contexts
+kubectl config use-context cluster1
+
+# Check API resource names:
+kubectl api-resources | grep -i ingress
+kubectl explain pod.spec.containers.resources
+
+# ── COMMON EXAM MISTAKES ──────────────────────────────────────
+# Wrong cluster context → always check context first
+# PVC not bound → StorageClass name mismatch in PVC
+# RBAC not working → Role in wrong namespace or missing RoleBinding
+# NetworkPolicy not working → CNI doesn't support it (use Calico)
+# Init container failing → main container never starts, check init logs
+# Node drain blocked → PDB + single replica, needs 2+ replicas
+```
+
+---
+
+## 27. Pod Security Admission — PSA (CKA/CKAD)
+
+```
+Replaced PodSecurityPolicy (deprecated 1.21, removed 1.25).
+Built into Kubernetes — no extra install.
+
+THREE PROFILES:
+  privileged  → no restrictions (system/infra namespaces)
+  baseline    → prevents known privilege escalations
+  restricted  → hardened, follows security best practices
+
+THREE MODES (per namespace label):
+  enforce → reject violating pods
+  audit   → allow but log violations
+  warn    → allow but show warning to user
+```
+
+```yaml
+# Apply via namespace labels
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+```yaml
+# Compliant pod under "restricted" profile
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: nginx:alpine
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
+```
+
+```
+What FAILS under "restricted":
+- runAsRoot (missing runAsNonRoot: true)
+- privileged: true containers
+- hostNetwork / hostPID / hostIPC: true
+- hostPath volumes
+- capabilities not dropped
+- missing seccompProfile
+- allowPrivilegeEscalation: true (default!)
+```
