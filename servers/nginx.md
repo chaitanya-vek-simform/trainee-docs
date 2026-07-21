@@ -1629,3 +1629,804 @@ curl -w "%{http_code} %{time_total}s\n" -o /dev/null -s https://example.com
 ---
 
 > **End of Nginx Guide** | [🏠 Home](../README.md) · [Servers](README.md) · [Next: Apache →](apache.md)
+
+
+---
+
+## 13. Building an Nginx Config From Scratch — Line by Line
+
+> Every directive explained. Start with a blank file and understand what each line does.
+
+### 13.1 The Minimal Working Config
+
+```nginx
+# /etc/nginx/nginx.conf — absolute minimum to serve a site
+
+# Which user nginx worker processes run as
+# Must have read access to web root
+user www-data;
+
+# One worker per CPU core — auto detects
+worker_processes auto;
+
+# Error log location and level (debug|info|notice|warn|error|crit)
+error_log /var/log/nginx/error.log warn;
+
+# File storing the master process PID (used by init scripts)
+pid /run/nginx.pid;
+
+events {
+    # Max simultaneous connections per worker
+    # Total = worker_processes × worker_connections
+    # With 4 CPUs × 1024 = 4096 simultaneous connections
+    worker_connections 1024;
+
+    # Accept as many connections as possible per wakeup
+    # (reduces syscall overhead on high-traffic servers)
+    multi_accept on;
+
+    # Linux: most efficient connection processing method
+    use epoll;
+}
+
+http {
+    # Include MIME type definitions (maps .html → text/html, .jpg → image/jpeg, etc.)
+    # Without this, browsers download files instead of rendering them
+    include /etc/nginx/mime.types;
+
+    # Default MIME type for unknown file extensions
+    default_type application/octet-stream;
+
+    # Send files using kernel sendfile() — avoids userspace copy
+    # Huge performance win for static files
+    sendfile on;
+
+    # Batch TCP packets before sending (works with sendfile)
+    tcp_nopush on;
+
+    # Flush data immediately (good for APIs/streaming, less good for bulk transfer)
+    tcp_nodelay on;
+
+    # How long to keep idle client connections open (reuse TCP)
+    keepalive_timeout 65;
+
+    # Log format: name + fields
+    log_format main '$remote_addr - $remote_user [$time_local] '
+                    '"$request" $status $body_bytes_sent '
+                    '"$http_referer" "$http_user_agent"';
+
+    # Access log location and format
+    access_log /var/log/nginx/access.log main;
+
+    # Include individual site configs from sites-enabled/
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+```
+
+### 13.2 Adding a Virtual Host — Every Directive Explained
+
+```nginx
+# /etc/nginx/sites-available/myapp.conf
+
+server {
+    # Listen on port 80 for all IPv4 addresses
+    listen 80;
+
+    # Listen on port 80 for IPv6
+    listen [::]:80;
+
+    # Which domain(s) this server block handles
+    # Nginx matches Host header against this
+    server_name myapp.example.com www.myapp.example.com;
+
+    # Where static files are served from (absolute path)
+    root /var/www/myapp;
+
+    # Default file to serve when requesting a directory
+    # Tries index.html first, then index.htm
+    index index.html index.htm;
+
+    # Per-site access log
+    access_log /var/log/nginx/myapp_access.log main;
+    error_log  /var/log/nginx/myapp_error.log warn;
+
+    # Handle all requests
+    location / {
+        # Try to find the file at $uri, then $uri/ (directory),
+        # then fall back to /index.html (needed for SPAs)
+        try_files $uri $uri/ /index.html;
+
+        # What each argument means:
+        # $uri       — try the requested path as a file
+        # $uri/      — try it as a directory (serves index inside)
+        # /index.html— fallback: return this file (SPA catch-all)
+        # =404       — return 404 if nothing found (use for APIs)
+    }
+
+    # Serve static assets with long caching
+    location ~* \.(js|css|png|jpg|gif|ico|svg|woff2)$ {
+        # ~*  = case-insensitive regex match
+        # \. = literal dot
+        # $   = end of string
+
+        # Cache for 1 year in browser
+        expires 1y;
+
+        # Allows CDN/proxy to cache this resource
+        add_header Cache-Control "public, immutable";
+
+        # Don't log requests for static assets (reduces noise)
+        access_log off;
+    }
+
+    # Block access to hidden files (.git, .env, .htpasswd)
+    location ~ /\. {
+        # ~ = case-sensitive regex
+        # /\. = starts with /dot
+        deny all;
+    }
+}
+```
+
+### 13.3 Adding HTTPS — Every Directive Explained
+
+```nginx
+server {
+    # Redirect HTTP → HTTPS
+    listen 80;
+    listen [::]:80;
+    server_name myapp.example.com;
+
+    # 301 = permanent redirect (browsers cache this)
+    # 302 = temporary (browsers don't cache)
+    return 301 https://$host$request_uri;
+    # $host        = request Host header value
+    # $request_uri = full path including query string
+}
+
+server {
+    # ssl tells nginx this is an HTTPS listener
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    # http2 enables HTTP/2 protocol (multiplexing, compression)
+    # Requires HTTPS
+    http2 on;
+
+    server_name myapp.example.com;
+
+    # Your certificate (public) — sent to clients
+    ssl_certificate     /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
+
+    # Your private key — NEVER expose this
+    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
+
+    # Reuse SSL session parameters — avoids full handshake on reconnect
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Disable TLS 1.0 and 1.1 (insecure, deprecated)
+    # Only allow TLS 1.2 and 1.3
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Which cipher suites to accept (modern, secure set)
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+
+    # Use server's cipher preference order (not client's)
+    ssl_prefer_server_ciphers off;
+
+    # HSTS: tell browsers to ALWAYS use HTTPS for this domain
+    # max-age=31536000 = 1 year
+    # includeSubDomains = applies to *.myapp.example.com too
+    # preload = allows inclusion in browser preload lists
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # ... rest of location blocks
+}
+```
+
+### 13.4 Building a Reverse Proxy From Scratch
+
+```nginx
+# Complete annotated reverse proxy config
+
+# Define the upstream application server(s)
+upstream myapp_backend {
+    # keepalive: reuse connections to backend (avoid TCP overhead per request)
+    # 32 = max idle connections to keep open
+    keepalive 32;
+
+    server 127.0.0.1:8000;   # app server address
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.myapp.example.com;
+
+    # SSL config (abbreviated)
+    ssl_certificate /etc/letsencrypt/live/api.myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.myapp.example.com/privkey.pem;
+
+    # Client request body size limit
+    # Default is 1m — increase for file upload endpoints
+    client_max_body_size 50m;
+
+    # How long to wait reading the request body from client
+    client_body_timeout 60s;
+
+    location / {
+        # Pass all requests to the upstream group
+        proxy_pass http://myapp_backend;
+
+        # HTTP version for upstream connections
+        # 1.1 required for keepalive and WebSockets
+        proxy_http_version 1.1;
+
+        # Required for keepalive (removes Connection: close header)
+        proxy_set_header Connection "";
+
+        # Tell the backend the actual client IP
+        # Without this: backend sees Nginx's IP (127.0.0.1), not client's
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # Chain of IPs if there are multiple proxies
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # Was the original request HTTP or HTTPS?
+        # Backend needs this to build correct redirect URLs
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Forward the original Host header (not Nginx's server_name)
+        # Critical for multi-tenant apps that route by Host
+        proxy_set_header Host $host;
+
+        # How long to wait for backend to accept connection
+        proxy_connect_timeout 10s;
+
+        # How long to wait for backend to send data
+        proxy_read_timeout 60s;
+
+        # How long to wait for backend to receive data
+        proxy_send_timeout 60s;
+
+        # Buffer responses in memory before sending to client
+        # on = collect full response then send (better for slow clients)
+        # off = stream response immediately (better for large files)
+        proxy_buffering on;
+        proxy_buffer_size 4k;
+        proxy_buffers 8 4k;
+
+        # Retry on failure (next upstream server)
+        # Only retries on connection errors, not app errors
+        proxy_next_upstream error timeout;
+    }
+
+    # Health check endpoint — no logging, no auth
+    location = /health {
+        proxy_pass http://myapp_backend;
+        access_log off;
+    }
+}
+```
+
+---
+
+## 14. Complete Stack-Specific Config Files
+
+### 14.1 React / Vue / Angular SPA
+
+```nginx
+# /etc/nginx/sites-available/spa-app.conf
+# Single Page Application — all routes handled by index.html
+
+server {
+    listen 80;
+    server_name myapp.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name myapp.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
+
+    root /var/www/myapp/dist;
+    index index.html;
+
+    # Gzip compression for text assets
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml image/svg+xml;
+    gzip_min_length 1000;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" always;
+
+    # SPA routing: serve index.html for any unknown path
+    # This lets React Router / Vue Router handle routing client-side
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Hashed static assets (webpack/vite output like main.abc123.js)
+    # These are content-addressable — safe to cache forever
+    location ~* \.(js|css)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Images and fonts — long cache
+    location ~* \.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)$ {
+        expires 6M;
+        add_header Cache-Control "public";
+    }
+
+    # index.html — NO cache (always fetch latest)
+    # Critical: if cached, users see old JS filenames and get 404s
+    location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+    }
+}
+```
+
+### 14.2 Next.js (SSR / Node.js)
+
+```nginx
+# /etc/nginx/sites-available/nextjs.conf
+# Next.js running on port 3000 — Nginx as reverse proxy + static asset server
+
+upstream nextjs {
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name myapp.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
+
+    client_max_body_size 50m;
+
+    # Serve Next.js static output directly (bypass Node.js)
+    # .next/static contains hashed files — cache forever
+    location /_next/static {
+        alias /var/www/myapp/.next/static;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # Serve public/ folder directly (images, favicon, robots.txt)
+    location /public {
+        alias /var/www/myapp/public;
+        expires 30d;
+        add_header Cache-Control "public";
+    }
+
+    # Next.js image optimization endpoint
+    location /_next/image {
+        proxy_pass http://nextjs;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Cache optimized images at proxy level
+        proxy_cache_valid 200 60m;
+    }
+
+    # All other requests → Next.js (SSR + API routes)
+    location / {
+        proxy_pass http://nextjs;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+### 14.3 Django / FastAPI / Flask (Python)
+
+```nginx
+# /etc/nginx/sites-available/django.conf
+# Django running via Gunicorn on Unix socket
+
+upstream django_gunicorn {
+    # Unix socket — faster than TCP localhost (no TCP overhead)
+    server unix:/run/gunicorn/myapp.sock;
+    keepalive 16;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.myapp.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.myapp.example.com/privkey.pem;
+
+    client_max_body_size 20m;
+
+    # Django static files — served by Nginx (never hit Gunicorn)
+    # Path set by STATIC_ROOT in settings.py, after: python manage.py collectstatic
+    location /static/ {
+        alias /var/www/myapp/staticfiles/;
+        expires 30d;
+        add_header Cache-Control "public";
+    }
+
+    # Django media uploads — user-uploaded files
+    location /media/ {
+        alias /var/www/myapp/media/;
+        expires 7d;
+        add_header Cache-Control "public";
+
+        # Prevent script execution in media directory (security)
+        location ~* \.(php|py|sh|pl)$ {
+            deny all;
+        }
+    }
+
+    # All API requests → Gunicorn
+    location / {
+        proxy_pass http://django_gunicorn;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Django uses SCRIPT_NAME for subdirectory deployments
+        proxy_set_header SCRIPT_NAME "";
+
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 120s;   # Allow longer for slow DB queries
+    }
+}
+```
+
+### 14.4 Laravel / WordPress (PHP-FPM)
+
+```nginx
+# /etc/nginx/sites-available/laravel.conf
+# Laravel — PHP via PHP-FPM on Unix socket
+
+server {
+    listen 443 ssl http2;
+    server_name myapp.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
+
+    # Laravel's web root is the public/ subdirectory
+    root /var/www/laravel/public;
+    index index.php;
+
+    client_max_body_size 100m;
+
+    # Laravel routing — all requests go to index.php
+    location / {
+        # Try file, then directory, then pass to index.php
+        # This enables Laravel's URL routing
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # Block access to sensitive Laravel files
+    location ~ /\.(?!well-known).* {
+        deny all;    # Hide .env, .git, etc.
+    }
+
+    location ~ \.(sql|sqlite|bak|config)$ {
+        deny all;    # Block database/config files
+    }
+
+    # PHP files → PHP-FPM
+    location ~ \.php$ {
+        # Prevent PHP execution in upload directories (LFI protection)
+        try_files $uri =404;
+
+        # Split path info for PHP (e.g. /app.php/route)
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+
+        # PHP-FPM socket
+        fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+
+        fastcgi_index index.php;
+
+        # Standard FastCGI params
+        include fastcgi_params;
+
+        # The full filesystem path to the script
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+
+        # Additional path info for PHP frameworks
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+
+        # Timeouts for PHP execution
+        fastcgi_read_timeout 300s;
+        fastcgi_connect_timeout 10s;
+
+        # Buffers for PHP response
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+    }
+
+    # Cache static assets
+    location ~* \.(css|js|png|jpg|gif|ico|svg|woff2|ttf)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+}
+```
+
+### 14.5 Node.js Microservices API Gateway
+
+```nginx
+# /etc/nginx/sites-available/api-gateway.conf
+# Route different API paths to different microservices
+
+upstream auth_service     { server 127.0.0.1:3001; keepalive 16; }
+upstream user_service     { server 127.0.0.1:3002; keepalive 16; }
+upstream product_service  { server 127.0.0.1:3003; keepalive 16; }
+upstream order_service    { server 127.0.0.1:3004; keepalive 16; }
+
+# Rate limiting zones
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=100r/m;
+limit_req_zone $binary_remote_addr zone=auth_limit:10m rate=10r/m;
+
+server {
+    listen 443 ssl http2;
+    server_name api.myapp.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.myapp.example.com/privkey.pem;
+
+    client_max_body_size 10m;
+
+    # Common proxy headers (avoids repetition)
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Auth service (strict rate limiting — prevent brute force)
+    location /api/v1/auth {
+        limit_req zone=auth_limit burst=5 nodelay;
+        proxy_pass http://auth_service;
+    }
+
+    # User service
+    location /api/v1/users {
+        limit_req zone=api_limit burst=20;
+        proxy_pass http://user_service;
+    }
+
+    # Product service
+    location /api/v1/products {
+        limit_req zone=api_limit burst=50;
+        proxy_pass http://product_service;
+
+        # Cache GET responses for 60 seconds
+        proxy_cache api_cache;
+        proxy_cache_methods GET;
+        proxy_cache_valid 200 60s;
+        add_header X-Cache-Status $upstream_cache_status;
+    }
+
+    # Order service (no caching — always fresh)
+    location /api/v1/orders {
+        limit_req zone=api_limit burst=20;
+        proxy_pass http://order_service;
+    }
+
+    # Health check aggregator
+    location = /health {
+        access_log off;
+        return 200 'OK';
+        add_header Content-Type text/plain;
+    }
+
+    # Block everything else
+    location / {
+        return 404 '{"error":"Not Found"}';
+        add_header Content-Type application/json;
+    }
+}
+```
+
+---
+
+## 15. Advanced Redirect & Rewrite Patterns
+
+```nginx
+# ── PERMANENT REDIRECTS ───────────────────────────────────────
+
+# Simple domain change (old → new)
+server {
+    server_name old-domain.com;
+    return 301 https://new-domain.com$request_uri;
+}
+
+# www to non-www (canonical)
+server {
+    server_name www.example.com;
+    return 301 https://example.com$request_uri;
+}
+
+# Non-www to www
+server {
+    server_name example.com;
+    return 301 https://www.example.com$request_uri;
+}
+
+# Old URL structure to new
+location /old-blog/ {
+    return 301 /articles/$1;   # capture group from regex
+}
+
+# ── REWRITE RULES ─────────────────────────────────────────────
+
+# rewrite syntax: rewrite <regex> <replacement> [flag];
+# Flags:
+# last     — stop processing rewrites, re-search location blocks
+# break    — stop processing rewrites, continue in this block
+# redirect — 302 temporary
+# permanent— 301 permanent
+
+# Remove trailing slash (except root)
+rewrite ^([^.]*[^/])/$ $1 permanent;
+
+# Force lowercase URL
+rewrite ^/([A-Z].*)$ /$1 permanent;   # partial — use map for full
+
+# Rewrite /user/123 → /user.php?id=123
+location /user/ {
+    rewrite ^/user/([0-9]+)$ /user.php?id=$1 last;
+}
+
+# ── MAP DIRECTIVE (efficient conditional logic) ────────────────
+
+# map is evaluated at config load — very efficient
+# Better than if() for most use cases
+
+# Map mobile user agents to a flag
+map $http_user_agent $is_mobile {
+    default 0;
+    ~*android 1;
+    ~*iphone  1;
+    ~*mobile  1;
+}
+
+# Use the flag in a location
+location / {
+    if ($is_mobile) {
+        return 302 https://m.example.com$request_uri;
+    }
+    try_files $uri $uri/ /index.html;
+}
+
+# Map country code to content (from GeoIP variable)
+map $geoip2_data_country_code $allowed {
+    default 1;
+    RU 0;   # Block Russia
+    CN 0;   # Block China
+}
+
+# Map maintenance mode
+map $uri $maintenance {
+    default 0;
+    ~^/api 0;        # Never block API
+    ~/health 0;      # Never block health check
+}
+
+# ── CONDITIONAL RETURNS ───────────────────────────────────────
+
+# Block specific user agents
+if ($http_user_agent ~* (scrapy|python-requests|curl)) {
+    return 403;
+}
+
+# Maintenance mode
+if (-f /var/www/maintenance.flag) {
+    return 503;
+}
+
+# Block requests missing required header
+if ($http_x_api_key = "") {
+    return 401 '{"error":"API key required"}';
+}
+```
+
+---
+
+## 16. Headers Manipulation Deep Dive
+
+```nginx
+# ── ADD HEADERS TO RESPONSE ───────────────────────────────────
+
+# add_header adds to response sent to client
+# 'always' = add even on error responses (4xx, 5xx)
+# Without 'always': only added on 2xx and 3xx
+
+add_header X-Frame-Options "DENY" always;              # Prevent clickjacking
+add_header X-Content-Type-Options "nosniff" always;    # Prevent MIME sniffing
+add_header X-XSS-Protection "1; mode=block" always;   # Legacy XSS filter
+add_header Referrer-Policy "strict-origin" always;     # Referrer info sent
+add_header Permissions-Policy "camera=(), microphone=()" always;  # Feature policy
+
+# Content Security Policy (prevent XSS)
+add_header Content-Security-Policy "
+    default-src 'self';
+    script-src 'self' https://cdn.jsdelivr.net;
+    style-src 'self' 'unsafe-inline';
+    img-src 'self' data: https:;
+    font-src 'self' https://fonts.gstatic.com;
+    connect-src 'self' https://api.myapp.com;
+    frame-ancestors 'none';
+" always;
+
+# ── MODIFY REQUEST HEADERS TO BACKEND ─────────────────────────
+
+proxy_set_header Host $host;                          # Forward original host
+proxy_set_header X-Real-IP $remote_addr;              # Client IP
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # Chain of IPs
+proxy_set_header X-Forwarded-Proto $scheme;           # http or https
+proxy_set_header X-Request-ID $request_id;            # Unique request ID for tracing
+
+# Add custom header to all backend requests
+proxy_set_header X-Internal-Source "nginx-proxy";
+
+# Remove sensitive headers before forwarding
+proxy_set_header Authorization "";    # Strip auth header (set your own)
+proxy_set_header Cookie "";           # Strip cookies (for public caching)
+
+# ── REMOVE HEADERS FROM RESPONSE ──────────────────────────────
+
+# Hide server info (security)
+more_clear_headers Server;            # requires headers-more module
+more_clear_headers X-Powered-By;
+
+# Or hide with: server_tokens off; (hides version number)
+server_tokens off;
+
+# ── CORS HEADERS ──────────────────────────────────────────────
+
+# Allow specific origin
+add_header Access-Control-Allow-Origin "https://myapp.example.com" always;
+
+# Allow multiple methods
+add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+
+# Allow these headers in requests
+add_header Access-Control-Allow-Headers "Authorization, Content-Type, X-Requested-With" always;
+
+# Cache preflight (OPTIONS) for 24 hours
+add_header Access-Control-Max-Age "86400" always;
+
+# Handle OPTIONS preflight
+location / {
+    if ($request_method = OPTIONS) {
+        add_header Access-Control-Allow-Origin "https://myapp.example.com";
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS";
+        add_header Access-Control-Allow-Headers "Authorization, Content-Type";
+        add_header Access-Control-Max-Age "86400";
+        return 204;    # 204 No Content — success with no body
+    }
+    proxy_pass http://backend;
+}
+```

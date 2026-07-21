@@ -1912,3 +1912,628 @@ EXPOSE 80
 ---
 
 > **End of Apache Guide** | [🏠 Home](../README.md) · [Servers](README.md) · [← Prev: Nginx](nginx.md) · [Next: IIS →](iis.md)
+
+
+---
+
+## 15. Building an Apache Config From Scratch — Line by Line
+
+> Every directive explained. Start with a blank file and understand what each line does.
+
+### 15.1 The Minimal Working Config
+
+```apache
+# /etc/apache2/apache2.conf — core server settings
+
+# User/group Apache processes run as
+User www-data
+Group www-data
+
+# Main server's hostname (used in error messages and redirects)
+ServerName myserver.example.com
+
+# Suppress OS info in Server header (security)
+ServerTokens Prod
+
+# Suppress version number in error pages (security)
+ServerSignature Off
+
+# Root directory Apache can serve FROM
+# Everything outside this requires explicit Allow
+ServerRoot "/etc/apache2"
+
+# Error log
+ErrorLog ${APACHE_LOG_DIR}/error.log
+
+# Log level: debug info notice warn error crit alert emerg
+LogLevel warn
+
+# Include additional configuration
+IncludeOptional conf-enabled/*.conf
+IncludeOptional sites-enabled/*.conf
+
+# Listen on port 80 for all interfaces
+Listen 80
+
+# Timeout for incomplete requests (seconds)
+Timeout 300
+
+# Max keep-alive requests per connection (0 = unlimited)
+MaxKeepAliveRequests 100
+
+# Keep-alive timeout between requests (seconds)
+KeepAliveTimeout 5
+
+# Keep-alive on or off
+KeepAlive On
+```
+
+### 15.2 Building a VirtualHost — Every Directive Explained
+
+```apache
+# /etc/apache2/sites-available/myapp.conf
+
+<VirtualHost *:80>
+    # *:80 means: respond to any IP address on port 80
+    # 10.0.0.5:80 would bind to a specific IP only
+
+    # Which domain(s) this VirtualHost handles
+    # Apache matches incoming Host header against this
+    ServerName myapp.example.com
+
+    # Aliases — additional domains that map to the same VirtualHost
+    ServerAlias www.myapp.example.com *.myapp.example.com
+
+    # Webmaster email (shown in error pages)
+    ServerAdmin webmaster@myapp.example.com
+
+    # The root directory for web content
+    # All relative file paths are resolved from here
+    DocumentRoot /var/www/myapp
+
+    # Per-site access log (separate from global log)
+    CustomLog /var/log/apache2/myapp_access.log combined
+
+    # Per-site error log
+    ErrorLog /var/log/apache2/myapp_error.log
+
+    # Control access to DocumentRoot
+    <Directory /var/www/myapp>
+        # Options controls what features are enabled
+        # Indexes = allow directory listing (DANGEROUS in prod — remove it!)
+        # FollowSymLinks = follow symlinks (needed for Indexes)
+        # -Indexes = disable directory listing
+        # +FollowSymLinks = enable symlink following
+        Options -Indexes +FollowSymLinks
+
+        # AllowOverride controls what .htaccess files can override
+        # None = .htaccess ignored entirely (fastest — no per-request file read)
+        # All = allow .htaccess to override everything
+        # FileInfo = allow .htaccess to control: redirects, MIME types, etc.
+        # AuthConfig = allow .htaccess to set authentication
+        # Limit = allow .htaccess to control method access
+        AllowOverride All
+
+        # Access control (Apache 2.4+ syntax)
+        # Require all granted = allow all requests
+        # Require ip 10.0.0.0/8 = only allow from this IP range
+        # Require host example.com = only allow from this hostname
+        Require all granted
+    </Directory>
+
+    # Block access to hidden files (.env, .git, .htpasswd)
+    <FilesMatch "^\.">
+        Require all denied
+    </FilesMatch>
+
+    # Block sensitive file types
+    <FilesMatch "\.(sql|sqlite|bak|config|md|log)$">
+        Require all denied
+    </FilesMatch>
+</VirtualHost>
+```
+
+### 15.3 Adding HTTPS — Every Directive Explained
+
+```apache
+# /etc/apache2/sites-available/myapp-ssl.conf
+
+# Enable SSL module first: a2enmod ssl
+
+<VirtualHost *:80>
+    ServerName myapp.example.com
+
+    # Redirect all HTTP to HTTPS
+    # 301 = permanent, 302 = temporary
+    Redirect permanent / https://myapp.example.com/
+    # Or use RewriteRule for more control:
+    # RewriteEngine On
+    # RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName myapp.example.com
+    DocumentRoot /var/www/myapp
+
+    # Enable SSL for this VirtualHost
+    SSLEngine on
+
+    # Your certificate (public) — sent to clients
+    SSLCertificateFile /etc/letsencrypt/live/myapp.example.com/cert.pem
+
+    # Your private key — NEVER expose
+    SSLCertificateKeyFile /etc/letsencrypt/live/myapp.example.com/privkey.pem
+
+    # Intermediate CA certificates chain
+    # Required so clients can verify your cert is trusted
+    SSLCertificateChainFile /etc/letsencrypt/live/myapp.example.com/chain.pem
+
+    # Disable old insecure protocols
+    SSLProtocol all -SSLv2 -SSLv3 -TLSv1 -TLSv1.1
+    # Result: only TLS 1.2 and 1.3 allowed
+
+    # Cipher suites to accept (modern, secure)
+    SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+
+    # Use server's cipher preference (not client's)
+    SSLHonorCipherOrder off
+
+    # HSTS: force HTTPS in browser for 1 year
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # Security headers
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer-when-downgrade"
+
+    <Directory /var/www/myapp>
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    CustomLog /var/log/apache2/myapp_ssl_access.log combined
+    ErrorLog /var/log/apache2/myapp_ssl_error.log
+</VirtualHost>
+```
+
+### 15.4 Reverse Proxy From Scratch
+
+```apache
+# /etc/apache2/sites-available/proxy.conf
+# Enable required modules first:
+# a2enmod proxy proxy_http proxy_balancer lbmethod_byrequests headers
+
+<VirtualHost *:443>
+    ServerName api.myapp.example.com
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/api.myapp.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/api.myapp.example.com/privkey.pem
+
+    # Don't serve local files — everything goes to backend
+    # ProxyRequests Off = reverse proxy mode (NOT forward proxy)
+    ProxyRequests Off
+
+    # Preserve original Host header when proxying
+    # Without this: backend sees api.myapp.example.com, may redirect incorrectly
+    ProxyPreserveHost On
+
+    # Add client IP header so backend knows real client
+    RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Real-IP "%{REMOTE_ADDR}s"
+
+    # ProxyPass: forward requests to backend
+    # / = all requests
+    # http://127.0.0.1:8000/ = backend URL
+    ProxyPass / http://127.0.0.1:8000/
+
+    # ProxyPassReverse: rewrite Location headers in responses
+    # If backend returns "Location: http://127.0.0.1:8000/login"
+    # Apache rewrites it to "Location: https://api.myapp.example.com/login"
+    ProxyPassReverse / http://127.0.0.1:8000/
+
+    # Timeout waiting for backend connection
+    ProxyTimeout 60
+
+    # Error handling — show friendly error if backend is down
+    ErrorDocument 502 /maintenance.html
+    ErrorDocument 503 /maintenance.html
+
+    CustomLog /var/log/apache2/api_access.log combined
+    ErrorLog /var/log/apache2/api_error.log
+</VirtualHost>
+```
+
+---
+
+## 16. Complete Stack-Specific Config Files
+
+### 16.1 React / Vue / Angular SPA
+
+```apache
+# /etc/apache2/sites-available/spa.conf
+# Requires: a2enmod rewrite headers
+
+<VirtualHost *:443>
+    ServerName myapp.example.com
+    DocumentRoot /var/www/myapp/dist
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/myapp.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/myapp.example.com/privkey.pem
+
+    # Security headers
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer-when-downgrade"
+    Header always set Strict-Transport-Security "max-age=31536000"
+
+    <Directory /var/www/myapp/dist>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+
+        # SPA Routing: send all unknown paths to index.html
+        # Without this, refreshing on /about returns 404
+        RewriteEngine On
+
+        # If the requested file exists, serve it directly
+        RewriteCond %{REQUEST_FILENAME} -f
+        RewriteRule ^ - [L]
+
+        # If the requested directory exists, serve it
+        RewriteCond %{REQUEST_FILENAME} -d
+        RewriteRule ^ - [L]
+
+        # Everything else → index.html (SPA handles routing)
+        RewriteRule ^ /index.html [L]
+    </Directory>
+
+    # Hashed JS/CSS assets — cache forever (content-addressable)
+    <FilesMatch "\.(js|css)$">
+        # Check if filename has hash (8+ hex chars before extension)
+        <If "%{REQUEST_URI} =~ /[a-f0-9]{8,}\.(js|css)$/">
+            Header set Cache-Control "max-age=31536000, public, immutable"
+        </If>
+    </FilesMatch>
+
+    # index.html — no cache
+    <FilesMatch "^index\.html$">
+        Header set Cache-Control "no-cache, no-store, must-revalidate"
+        Header set Pragma "no-cache"
+    </FilesMatch>
+
+    # Images and fonts
+    <FilesMatch "\.(png|jpg|gif|svg|ico|woff2|woff|ttf)$">
+        Header set Cache-Control "max-age=15552000, public"
+    </FilesMatch>
+</VirtualHost>
+```
+
+### 16.2 Laravel / WordPress (PHP-FPM)
+
+```apache
+# /etc/apache2/sites-available/laravel.conf
+# Requires: a2enmod rewrite proxy_fcgi setenvif
+# a2enconf php8.2-fpm
+
+<VirtualHost *:443>
+    ServerName myapp.example.com
+
+    # Laravel's DocumentRoot is the public/ directory
+    DocumentRoot /var/www/laravel/public
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/myapp.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/myapp.example.com/privkey.pem
+
+    <Directory /var/www/laravel/public>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+
+        # Laravel routing via .htaccess (this .htaccess rule is standard Laravel)
+        # But including it here as an example:
+        RewriteEngine On
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteRule ^ index.php [L]
+    </Directory>
+
+    # Block direct access to sensitive Laravel files
+    <Files ".env">
+        Require all denied
+    </Files>
+
+    <FilesMatch "\.(sql|sqlite|bak)$">
+        Require all denied
+    </FilesMatch>
+
+    # PHP-FPM via Unix socket
+    <FilesMatch "\.php$">
+        SetHandler "proxy:unix:/run/php/php8.2-fpm.sock|fcgi://localhost"
+    </FilesMatch>
+
+    # Don't execute PHP in storage/public (user uploads)
+    <Directory /var/www/laravel/storage>
+        <FilesMatch "\.php$">
+            Require all denied
+        </FilesMatch>
+    </Directory>
+
+    CustomLog /var/log/apache2/laravel_access.log combined
+    ErrorLog /var/log/apache2/laravel_error.log
+</VirtualHost>
+```
+
+### 16.3 WordPress Multi-Site
+
+```apache
+<VirtualHost *:443>
+    ServerName mywordpress.example.com
+    DocumentRoot /var/www/wordpress
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/mywordpress.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/mywordpress.example.com/privkey.pem
+
+    <Directory /var/www/wordpress>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # WordPress standard .htaccess (put this in AllowOverride or inline):
+    # RewriteEngine On
+    # RewriteBase /
+    # RewriteRule ^index\.php$ - [L]
+    # RewriteCond %{REQUEST_FILENAME} !-f
+    # RewriteCond %{REQUEST_FILENAME} !-d
+    # RewriteRule . /index.php [L]
+
+    # Block xmlrpc.php (frequent brute force target)
+    <Files "xmlrpc.php">
+        Require all denied
+    </Files>
+
+    # Block wp-config.php access
+    <Files "wp-config.php">
+        Require all denied
+    </Files>
+
+    # Protect uploads from PHP execution
+    <Directory /var/www/wordpress/wp-content/uploads>
+        <FilesMatch "\.php$">
+            Require all denied
+        </FilesMatch>
+    </Directory>
+
+    # PHP-FPM
+    <FilesMatch "\.php$">
+        SetHandler "proxy:unix:/run/php/php8.2-fpm.sock|fcgi://localhost"
+    </FilesMatch>
+</VirtualHost>
+```
+
+### 16.4 Python Django (mod_wsgi)
+
+```apache
+# /etc/apache2/sites-available/django.conf
+# Requires: pip install mod_wsgi; a2enmod wsgi
+
+<VirtualHost *:443>
+    ServerName api.myapp.example.com
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/api.myapp.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/api.myapp.example.com/privkey.pem
+
+    # WSGI entry point
+    # /var/www/myapp/myproject/wsgi.py
+    WSGIScriptAlias / /var/www/myapp/myproject/wsgi.py
+
+    # Run in separate process (daemon mode — recommended for Django)
+    # processes = number of worker processes
+    # threads = threads per process
+    WSGIDaemonProcess myapp python-home=/var/www/myapp/venv python-path=/var/www/myapp processes=2 threads=15
+
+    # Use the daemon process defined above
+    WSGIProcessGroup myapp
+
+    # Allow importing from Python's root path
+    WSGIApplicationGroup %{GLOBAL}
+
+    # Django static files — served directly by Apache
+    Alias /static/ /var/www/myapp/staticfiles/
+    <Directory /var/www/myapp/staticfiles>
+        Require all granted
+    </Directory>
+
+    # Django media files (user uploads)
+    Alias /media/ /var/www/myapp/media/
+    <Directory /var/www/myapp/media>
+        Require all granted
+        # Block PHP execution in uploads
+        <FilesMatch "\.php$">
+            Require all denied
+        </FilesMatch>
+    </Directory>
+
+    # Django wsgi directory
+    <Directory /var/www/myapp/myproject>
+        <Files wsgi.py>
+            Require all granted
+        </Files>
+    </Directory>
+</VirtualHost>
+```
+
+---
+
+## 17. mod_rewrite — Comprehensive Guide
+
+```apache
+# ── ENABLE MOD_REWRITE ────────────────────────────────────────
+# a2enmod rewrite
+# Then in Directory block: AllowOverride All (for .htaccess)
+# Or: AllowOverride FileInfo (just for rewrites)
+
+# ── REWRITERULE SYNTAX ────────────────────────────────────────
+# RewriteRule <pattern> <substitution> [flags]
+# Pattern: regex applied to URL PATH (not including domain)
+# Substitution: replacement (can include backreferences: $1, $2)
+# Flags: [L] = last, [R=301] = redirect, [P] = proxy, [NC] = no case
+
+# ── REWRITECOND SYNTAX ────────────────────────────────────────
+# RewriteCond <TestString> <CondPattern> [flags]
+# TestString: often a server variable like %{HTTP_HOST}, %{HTTPS}
+# CondPattern: regex or comparison
+# [OR] = OR with next condition (default is AND)
+# [NC] = case insensitive
+
+# ── COMMON PATTERNS ───────────────────────────────────────────
+
+# HTTP to HTTPS redirect
+RewriteEngine On
+RewriteCond %{HTTPS} off
+RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+# %{HTTPS} = "on" if HTTPS, "off" if HTTP
+# %{HTTP_HOST} = request hostname
+# %{REQUEST_URI} = full request path
+
+# www to non-www
+RewriteCond %{HTTP_HOST} ^www\.(.+) [NC]
+RewriteRule ^ https://%1%{REQUEST_URI} [L,R=301]
+# %1 = first capture group from RewriteCond (the domain without www)
+
+# Non-www to www
+RewriteCond %{HTTP_HOST} !^www\. [NC]
+RewriteRule ^ https://www.%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+# ! = negate condition
+
+# Remove trailing slash
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)/$ /$1 [L,R=301]
+# !-d = not a directory
+# Without the -d check: directories like /images/ would also be rewritten
+
+# SPA (React/Vue) routing
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ /index.html [L]
+# !-f = not an existing file
+# !-d = not an existing directory
+# Both conditions AND'd: only rewrite if not a real file or directory
+
+# Block by user agent
+RewriteCond %{HTTP_USER_AGENT} (scrapy|python-requests|wget) [NC,OR]
+RewriteCond %{HTTP_USER_AGENT} (curl|libwww-perl) [NC]
+RewriteRule ^ - [F,L]
+# - = no substitution (deny the request)
+# [F] = Forbidden (403)
+# [NC] = case insensitive
+# [OR] = OR with next RewriteCond
+
+# Rate limiting by IP (basic — use mod_evasive for real limiting)
+RewriteCond %{HTTP:X-Forwarded-For} ^123\.456\.789\.
+RewriteRule ^ - [F,L]
+
+# Redirect old URL structure to new
+RewriteRule ^/blog/([0-9]{4})/([0-9]{2})/(.+)$ /articles/$3 [L,R=301]
+# Matches: /blog/2024/03/my-post
+# Redirects to: /articles/my-post
+# $1=2024, $2=03, $3=my-post
+
+# Force lowercase URLs
+RewriteMap lowercase int:tolower
+RewriteCond %{REQUEST_URI} [A-Z]
+RewriteRule ^ ${lowercase:%{REQUEST_URI}} [R=301,L]
+
+# ── FLAG REFERENCE ────────────────────────────────────────────
+# [L]      Last — stop processing rules after this match
+# [R=301]  Redirect with 301 (permanent)
+# [R=302]  Redirect with 302 (temporary)
+# [P]      Proxy — pass to mod_proxy
+# [NC]     No Case — case insensitive match
+# [OR]     Or — join conditions with OR (not AND)
+# [F]      Forbidden — return 403
+# [G]      Gone — return 410
+# [E=var:val] Set environment variable
+# [S=n]    Skip next n rules
+# [T=mime] Set MIME type of response
+# [QSA]    Query String Append — append original query string
+# [NE]     No Escape — don't escape special chars in substitution
+```
+
+---
+
+## 18. .htaccess — Complete Reference
+
+```apache
+# .htaccess — per-directory config (requires AllowOverride)
+# PERFORMANCE NOTE: Apache reads .htaccess on EVERY request
+# For production, put config in VirtualHost and set AllowOverride None
+
+# ── WHAT .htaccess CAN CONTROL (with AllowOverride All) ───────
+
+# 1. REWRITES (requires AllowOverride FileInfo or All)
+Options +FollowSymLinks
+RewriteEngine On
+RewriteBase /         # Base path for relative RewriteRule substitutions
+
+# SPA routing
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.html [L]
+
+# 2. CUSTOM ERROR PAGES (AllowOverride FileInfo)
+ErrorDocument 404 /404.html
+ErrorDocument 500 /500.html
+ErrorDocument 503 /maintenance.html
+
+# 3. MIME TYPES (AllowOverride FileInfo)
+AddType application/javascript .js
+AddType text/css .css
+AddType font/woff2 .woff2
+
+# 4. AUTHENTICATION (AllowOverride AuthConfig)
+AuthType Basic
+AuthName "Protected Area"
+AuthUserFile /etc/apache2/.htpasswd    # Created with: htpasswd -c .htpasswd username
+Require valid-user
+
+# 5. IP ACCESS CONTROL (AllowOverride Limit)
+Require ip 10.0.0.0/8
+Require ip 192.168.1.0/24
+
+# 6. HEADERS (requires mod_headers, AllowOverride FileInfo)
+Header set X-Frame-Options "DENY"
+Header set Cache-Control "max-age=3600, public"
+
+# 7. COMPRESSION (requires mod_deflate)
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css application/javascript
+    AddOutputFilterByType DEFLATE text/xml application/json
+</IfModule>
+
+# 8. EXPIRY / CACHING (requires mod_expires)
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/html "access plus 1 hour"
+    ExpiresByType text/css "access plus 1 year"
+    ExpiresByType application/javascript "access plus 1 year"
+    ExpiresByType image/jpeg "access plus 6 months"
+    ExpiresByType image/png "access plus 6 months"
+    ExpiresByType font/woff2 "access plus 1 year"
+    ExpiresDefault "access plus 1 day"
+</IfModule>
+
+# 9. FILE PROTECTION — block access to sensitive files
+<FilesMatch "^(README|CHANGELOG|\.env|\.git|composer\.json|package\.json)">
+    Require all denied
+</FilesMatch>
+
+# 10. BLOCK DIRECTORY TRAVERSAL
+Options -Indexes
+```
